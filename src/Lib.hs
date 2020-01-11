@@ -1,15 +1,15 @@
 module Lib where
 
 import Control.Concurrent (threadDelay)
-import Control.Monad (forever, void)
-import System.Process (system)
-import System.Exit (ExitCode(..))
+import Control.Monad (forever, void, guard)
+import System.Process (system, readProcessWithExitCode)
+import System.Exit (ExitCode(..), exitFailure)
 import Data.List (nub, isInfixOf)
-import Data.Maybe (catMaybes)
-import System.Directory (getModificationTime)
-import Data.Time.Clock (UTCTime)
+import Data.Maybe (catMaybes, listToMaybe)
 import System.IO (hSetBuffering, BufferMode(NoBuffering), stdout)
-import Control.Concurrent.Async --(race)
+
+readMaybe :: Read a => String -> Maybe a
+readMaybe s = fst <$> listToMaybe (reads s)
 
 -- take a url and make it a shell command
 assembleCommand :: String -> String
@@ -23,6 +23,18 @@ assembleCommand = (yt <>) . sorround
 -- and elimnate most bad cases.
 isLink :: String -> Bool
 isLink url = "." `isInfixOf` url && "/" `isInfixOf` url
+
+handleExitCode :: ExitCode -> b -> b -> b
+handleExitCode (ExitFailure _) x y = x
+handleExitCode ExitSuccess     x y = y
+
+-- cifs can cause issues with the directory package
+-- so we make our own
+modificationTimeWithTimeout :: Integer -> FilePath -> IO (Maybe Integer)
+modificationTimeWithTimeout seconds fp = do
+    (ecode,time,_) <- readProcessWithExitCode
+      "timeout" [show seconds, "stat", "-c", "%Y", fp] ""
+    pure $ handleExitCode ecode Nothing (readMaybe time)
 
 
 -- do downloads
@@ -42,63 +54,48 @@ doEvent fp = do
     runCmd i@(com,name) = do
       putStrLn $ "--- Attempting download of: " ++ name
       res <- system com
-      case res of
-        ExitFailure _ ->
-           putStrLn "--- Attempt failed" *> pure (Just i)
-        ExitSuccess ->
-          putStrLn "--- Attempt succeeded" *> pure Nothing
+      handleExitCode res
+        (putStrLn "--- Attempt failed" *> pure (Just i))
+        (putStrLn "--- Attempt succeeded" *> pure Nothing)
 
+delayFor :: Integer -> IO ()
+delayFor s = threadDelay (fromIntegral s * 1000000)
+
+
+beb :: IO (Maybe a) -> IO b -> (a -> IO b) -> IO b
+beb act fail succeed = do
+    res <- act
+    case res of
+      Nothing -> fail
+      Just r -> succeed r
 
 -- watch a file for changes, use it to download videos
 -- check file modify time vs last time
--- cpu use of getModificationTime can spiral if the cifs mounted
--- file being watched is disconnected so we have a timeout
 runWatcher :: String -> IO ()
 runWatcher fp = do
     hSetBuffering stdout NoBuffering
     putStrLn "--- Initial Video Check"
-    -- this doesn't actually complete the race if getModificationTime
-    -- is accessing a mounted cifs partition who's remote pc is off
-    mod_time' <- race timeOut (getModificationTime fp)
-    case mod_time' of
-      Left _ -> putStrLn "getModificationTime took too long"
-      Right mod_time -> do
-        doEvent fp
-        threadDelay 7000000 -- wait some time, no need to check quickly
-        putStrLn "--- Initial Delay Ended"
-        forever $ loop mod_time
+    mod_time' <- modificationTimeWithTimeout 5 fp
+    beb (modificationTimeWithTimeout 5 fp)
+        (putStrLn "Getting modification time took too long or failed." *> exitFailure)
+        (\mod_time -> do
+            doEvent fp
+            delayFor 7
+            putStrLn "--- Initial Delay Ended"
+            forever $ loop mod_time
+        )
   where
-    timeOut :: IO ()
-    timeOut = threadDelay 10000000
-    loop :: UTCTime -> IO UTCTime
+    loop :: Integer -> IO Integer
     loop old_time = do
-      new_time <- getModificationTime fp
-      if new_time > old_time
-        then do
-          putStrLn $ "--- File modified at: " ++ show new_time
-          doEvent fp
-          putStrLn "--- Downloading Complete"
-          threadDelay 15000000 *> loop new_time
-        else threadDelay 15000000 *> loop old_time
-
--- bad
-raceTest :: IO (Either () Char)
-raceTest = race (threadDelay 2000000) (forever $ pure "c")
-
--- bad
-raceTest' :: IO (Either () Char)
-raceTest' = do
-    withAsync (threadDelay 2000000)
-      (\a -> withAsync (forever $ pure "c")
-        (\b -> waitEitherCancel a b))
-
--- fine maybe due to threadDelay having to be executed where pure could be lifted out
-raceTest'' :: IO (Either () Char)
-raceTest'' = race (threadDelay 2000000) (forever $ threadDelay 1 *> pure "c")
-
-
-
--- strace -f -p pid
--- -f is for following spawned threads
--- try +RTS -V0
--- to reduce RTS noise
+      mod_time' <- modificationTimeWithTimeout 5 fp
+      beb (modificationTimeWithTimeout 5 fp)
+          (putStrLn "Getting modification time took too long or failed." *> exitFailure)
+          (\new_time -> do
+              if new_time > old_time
+                then do
+                  putStrLn $ "--- File modified at: " ++ show new_time
+                  doEvent fp
+                  putStrLn "--- Downloading Complete"
+                  delayFor 15 *> loop new_time
+                else delayFor 15 *> loop old_time
+          )
