@@ -81,15 +81,20 @@ runWatcher fp = do
           threadDelay 15000000 *> loop new_time
         else threadDelay 15000000 *> loop old_time
 
+-- bad
 raceTest :: IO (Either () Char)
 raceTest = race (threadDelay 2000000) (forever $ pure "c")
 
+-- bad
 raceTest' :: IO (Either () Char)
 raceTest' = do
     withAsync (threadDelay 2000000)
       (\a -> withAsync (forever $ pure "c")
         (\b -> waitEitherCancel a b))
 
+-- fine maybe due to threadDelay having to be executed where pure could be lifted out
+raceTest'' :: IO (Either () Char)
+raceTest'' = race (threadDelay 2000000) (forever $ threadDelay 1 *> pure "c")
 
 
 
