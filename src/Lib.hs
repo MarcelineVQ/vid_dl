@@ -9,6 +9,7 @@ import Data.Maybe (catMaybes)
 import System.Directory (getModificationTime)
 import Data.Time.Clock (UTCTime)
 import System.IO (hSetBuffering, BufferMode(NoBuffering), stdout)
+import Control.Concurrent.Async --(race)
 
 -- take a url and make it a shell command
 assembleCommand :: String -> String
@@ -47,20 +48,28 @@ doEvent fp = do
         ExitSuccess ->
           putStrLn "--- Attempt succeeded" *> pure Nothing
 
--- track which ones succeeded and email that we got them?
 
 -- watch a file for changes, use it to download videos
 -- check file modify time vs last time
+-- cpu use of getModificationTime can spiral if the cifs mounted
+-- file being watched is disconnected so we have a timeout
 runWatcher :: String -> IO ()
 runWatcher fp = do
     hSetBuffering stdout NoBuffering
     putStrLn "--- Initial Video Check"
-    mod_time <- getModificationTime fp
-    doEvent fp
-    threadDelay 7000000 -- wait some time, no need to check quickly
-    putStrLn "--- Initial Delay Ended"
-    forever $ loop mod_time
+    -- this doesn't actually complete the race if getModificationTime
+    -- is accessing a mounted cifs partition who's remote pc is off
+    mod_time' <- race timeOut (getModificationTime fp)
+    case mod_time' of
+      Left _ -> putStrLn "getModificationTime took too long"
+      Right mod_time -> do
+        doEvent fp
+        threadDelay 7000000 -- wait some time, no need to check quickly
+        putStrLn "--- Initial Delay Ended"
+        forever $ loop mod_time
   where
+    timeOut :: IO ()
+    timeOut = threadDelay 10000000
     loop :: UTCTime -> IO UTCTime
     loop old_time = do
       new_time <- getModificationTime fp
@@ -71,3 +80,20 @@ runWatcher fp = do
           putStrLn "--- Downloading Complete"
           threadDelay 15000000 *> loop new_time
         else threadDelay 15000000 *> loop old_time
+
+raceTest :: IO (Either () Char)
+raceTest = race (threadDelay 2000000) (forever $ pure "c")
+
+raceTest' :: IO (Either () Char)
+raceTest' = do
+    withAsync (threadDelay 2000000)
+      (\a -> withAsync (forever $ pure "c")
+        (\b -> waitEitherCancel a b))
+
+
+
+
+-- strace -f -p pid
+-- -f is for following spawned threads
+-- try +RTS -V0
+-- to reduce RTS noise

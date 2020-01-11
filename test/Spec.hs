@@ -1,2 +1,8 @@
+import Lib
+
 main :: IO ()
-main = putStrLn "Test suite not yet implemented"
+main = do
+    r <- raceTest
+    case r of
+      Left l -> pure l
+      Right r -> putChar r
