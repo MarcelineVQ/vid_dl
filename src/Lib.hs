@@ -2,21 +2,16 @@ module Lib where
 
 import Control.Concurrent (threadDelay)
 import Control.Monad (forever, void, guard)
-import System.Process (system, readProcessWithExitCode)
+import System.Process (system, readProcessWithExitCode, delegate_ctlc, waitForProcess, createProcess_, proc, std_out, std_err, StdStream(..))
 import System.Exit (ExitCode(..), exitFailure)
 import Data.List (nub, isInfixOf)
 import Data.Maybe (catMaybes, listToMaybe)
-import System.IO (hSetBuffering, BufferMode(NoBuffering), stdout)
+import System.IO (hSetBuffering, BufferMode(..), stdout, hGetContents)
+
+import Control.Concurrent
 
 readMaybe :: Read a => String -> Maybe a
 readMaybe s = fst <$> listToMaybe (reads s)
-
--- take a url and make it a shell command
-assembleCommand :: String -> String
-assembleCommand = (yt <>) . sorround
-  where
-    yt = "youtube-dl -f \"best\" --no-playlist --newline "
-    sorround s = "\"" <> s <> "\""
 
 -- Not sure what's best universally.
 -- A dot + a slash are probably enough to cover most sites
@@ -29,20 +24,19 @@ handleExitCode (ExitFailure _) x y = x
 handleExitCode ExitSuccess     x y = y
 
 -- cifs can cause issues with the directory package
--- so we make our own
+-- so we make our own modification time checker
 modificationTimeWithTimeout :: Integer -> FilePath -> IO (Maybe Integer)
 modificationTimeWithTimeout seconds fp = do
     (ecode,time,_) <- readProcessWithExitCode
       "timeout" [show seconds, "stat", "-c", "%Y", fp] ""
     pure $ handleExitCode ecode Nothing (readMaybe time)
 
-
 -- do downloads
 doEvent :: String -> IO ()
 doEvent fp = do
     c <- nub . words <$> readFile fp
     let links = filter isLink c
-        coms = map (\x -> (assembleCommand x, x)) links
+        coms = map (\x -> (ytcmd False x, x)) links
     fails1 <- catMaybes <$> mapM runCmd coms
     -- retry failures
     fails2 <- catMaybes <$> mapM runCmd fails1
@@ -50,17 +44,41 @@ doEvent fp = do
     mapM_ runCmd fails2
   where
     -- return failures so we can retry them
-    runCmd :: (String, String) -> IO (Maybe (String, String))
+    runCmd :: (IO CmdResult, String) -> IO (Maybe (IO CmdResult, String))
     runCmd i@(com,name) = do
       putStrLn $ "--- Attempting download of: " ++ name
-      res <- system com
-      handleExitCode res
-        (putStrLn "--- Attempt failed" *> pure (Just i))
-        (putStrLn "--- Attempt succeeded" *> pure Nothing)
+      res <- com
+      case res of
+        Good -> putStrLn "--- Attempt succeeded" *> pure Nothing
+        FormatFailure -> (putStrLn "--- Format not available" *> pure (Just (ytcmd True name,name)))
+        OtherError _ -> (putStrLn "--- Attempt failed" *> pure (Just i))
 
 delayFor :: Integer -> IO ()
 delayFor s = threadDelay (fromIntegral s * 1000000)
 
+data CmdResult = Good | FormatFailure | OtherError ExitCode deriving (Show)
+cmd :: (String,[String]) -> IO CmdResult
+cmd (com,opts) = do
+    (_,Just hout,Just herr,p) <- createProcess_ "system" (proc com opts) { delegate_ctlc = True, std_out = CreatePipe, std_err = CreatePipe}
+    out <- hGetContents hout
+    err <- hGetContents herr
+    forkIO $ hSetBuffering stdout LineBuffering *> putStrLn out
+    exit <- waitForProcess p
+
+    pure $ case exit of
+      ExitSuccess -> Good
+      errR -> if isFormatError err
+        then FormatFailure
+        else OtherError errR
+  where
+    isFormatError = any ("format not available"`isInfixOf`) . lines
+
+-- take a url and make it a shell command
+ytcmd :: Bool -> String -> IO CmdResult
+ytcmd retry url = cmd ("youtube-dl",opts)
+  where
+    opts = ["-f", format, "--recode-video", "mp4", "--no-playlist", "--newline", url]
+    format = if retry then "best" else "bestvideo+bestaudio"
 
 beb :: IO (Maybe a) -> IO b -> (a -> IO b) -> IO b
 beb act fail succeed = do
@@ -68,6 +86,7 @@ beb act fail succeed = do
     case res of
       Nothing -> fail
       Just r -> succeed r
+
 
 -- watch a file for changes, use it to download videos
 -- check file modify time vs last time
